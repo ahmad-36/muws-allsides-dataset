@@ -1,5 +1,11 @@
 */crawls
 
+# Data files
+*.jsonl
+*.csv
+*.zip
+archive/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
