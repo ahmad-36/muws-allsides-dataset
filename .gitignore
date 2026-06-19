@@ -1,10 +1,14 @@
 */crawls
 
-# Data files
+# Scraped data & output (nothing scraped goes to GitHub)
 *.jsonl
+*.json
 *.csv
 *.zip
 archive/
+data/
+*/output/
+PIPELINE_SPEC.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
