@@ -134,6 +134,17 @@ def _extract_images(soup):
     return images
 
 
+_NAV_GARBAGE_MARKERS = [
+    "WP Intelligence operates independently",
+    "Stephen Gutowski\n Adam O'Neal",
+]
+
+
+def _is_nav_garbage(text):
+    """Detect WaPo sidebar/navigation text that trafilatura sometimes extracts."""
+    return any(m in text for m in _NAV_GARBAGE_MARKERS)
+
+
 def parse(html, url):
     soup = BeautifulSoup(html, "html.parser")
 
@@ -181,18 +192,25 @@ def parse(html, url):
                 p.get_text(" ", strip=True) for p in paras
                 if len(p.get_text(strip=True)) > 20
             )
-            if body:
+            if body and not _is_nav_garbage(body):
                 return headline, body, images
 
     for script in soup.select('script[type="application/ld+json"]'):
         try:
             data = json.loads(script.string)
             if isinstance(data, dict) and data.get("articleBody"):
-                return data.get("headline", headline), data["articleBody"], images
+                ab = data["articleBody"]
+                if not _is_nav_garbage(ab):
+                    return data.get("headline", headline), ab, images
         except Exception:
             pass
 
     return headline, "", images
 
+def _body_filter(body):
+    """Reject body text that is actually WaPo navigation/sidebar chrome."""
+    return not _is_nav_garbage(body)
+
+
 if __name__ == "__main__":
-    run_scraper(DOMAIN, parse, extra_headers=EXTRA_HEADERS)
+    run_scraper(DOMAIN, parse, extra_headers=EXTRA_HEADERS, body_filter=_body_filter)

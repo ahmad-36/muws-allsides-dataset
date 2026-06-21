@@ -4,11 +4,13 @@ Qbias Dataset Explorer — Streamlit App
 Launch:  streamlit run dataset_explorer.py
 """
 
+import hashlib
 import json
 import os
 import random
+import tempfile
+from collections import Counter
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -16,8 +18,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ── CONFIGURATION ────────────────────────────────────────────────────────────
-DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), "output", "per_domain")
-CLEANING_LOG_PATH = os.path.join(os.path.dirname(__file__), "cleaning_log.csv")
+CLEANING_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleaning_log.csv")
 
 RATING_ORDER = ["left", "lean left", "center", "lean right", "right"]
 RATING_COLORS = {
@@ -27,36 +28,61 @@ RATING_COLORS = {
     "lean right": "#ef8a62",
     "right": "#b2182b",
 }
-STANCE_COLORS = {"left": "#2166ac", "center": "#878787", "right": "#b2182b"}
+STATUS_COLOR_MAP = {
+    "SUCCESS": "#27ae60",
+    "FAILED_HTTP_404": "#e74c3c",
+    "FAILED_PARSE": "#f39c12",
+    "FAILED_PAYWALL": "#8e44ad",
+}
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner="Loading dataset …")
-def load_dataset(data_dir: str) -> pd.DataFrame:
-    """Read every per-domain JSON file and flatten into a single DataFrame."""
+def load_from_uploaded(uploaded_files: list) -> pd.DataFrame:
+    rows: list[dict] = []
+    for uf in uploaded_files:
+        data = json.load(uf)
+        for topic_slug, stances in data.items():
+            for stance_key, article in stances.items():
+                rows.append({
+                    "source_file": uf.name,
+                    "topic_slug": topic_slug,
+                    "stance_key": stance_key,
+                    **article,
+                })
+    return _post_process(pd.DataFrame(rows)) if rows else pd.DataFrame()
+
+
+@st.cache_resource(show_spinner="Loading dataset from directory …")
+def load_from_directory(data_dir: str) -> pd.DataFrame:
     rows: list[dict] = []
     for fname in sorted(os.listdir(data_dir)):
         if not fname.endswith(".json"):
             continue
-        fpath = os.path.join(data_dir, fname)
-        with open(fpath) as f:
+        with open(os.path.join(data_dir, fname)) as f:
             data = json.load(f)
         for topic_slug, stances in data.items():
             for stance_key, article in stances.items():
-                row = {
+                rows.append({
                     "source_file": fname,
                     "topic_slug": topic_slug,
                     "stance_key": stance_key,
                     **article,
-                }
-                rows.append(row)
-    df = pd.DataFrame(rows)
+                })
+    return _post_process(pd.DataFrame(rows)) if rows else pd.DataFrame()
+
+
+def _post_process(df: pd.DataFrame) -> pd.DataFrame:
     if "scrape_timestamp" in df.columns:
         df["scrape_timestamp"] = pd.to_datetime(df["scrape_timestamp"], errors="coerce")
         df["scrape_date"] = df["scrape_timestamp"].dt.date
     if "extracted_body_text" in df.columns:
         df["text_length"] = df["extracted_body_text"].fillna("").str.len()
     df["uid"] = df.index.astype(str)
+    # duplicate URL detection
+    if "url" in df.columns:
+        url_counts = df["url"].value_counts()
+        df["url_occurrences"] = df["url"].map(url_counts)
+        df["is_duplicate_url"] = df["url_occurrences"] > 1
     return df
 
 
@@ -70,12 +96,29 @@ def save_cleaning_log(log_df: pd.DataFrame) -> None:
     log_df.to_csv(CLEANING_LOG_PATH, index=False)
 
 
-def pretty_number(n: int | float) -> str:
+def pretty_number(n) -> str:
+    if pd.isna(n):
+        return "—"
+    n = float(n)
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(int(n))
+
+
+def safe_list(val) -> list:
+    """Safely extract a list from a DataFrame cell that might be list, NaN, None, or empty."""
+    if isinstance(val, list):
+        return val
+    try:
+        if pd.notna(val):
+            return list(val) if hasattr(val, '__iter__') and not isinstance(val, str) else []
+    except (TypeError, ValueError):
+        pass
+    return []
+
+
 
 
 # ── PAGE CONFIG ──────────────────────────────────────────────────────────────
@@ -86,40 +129,74 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown(
-    """
-    <style>
-    [data-testid="stMetric"] {
-        background: #f8f9fb;
-        border: 1px solid #e1e4e8;
-        border-radius: 8px;
-        padding: 12px 16px;
-    }
-    .block-container { padding-top: 1.5rem; }
-    div[data-testid="stExpander"] details {
-        border: 1px solid #e1e4e8;
-        border-radius: 8px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<style>
+[data-testid="stMetric"] {
+    background: #f0f2f6; border: 1px solid #d1d5db;
+    border-radius: 8px; padding: 12px 16px;
+}
+[data-testid="stMetric"] label {
+    color: #555 !important;
+}
+[data-testid="stMetric"] [data-testid="stMetricValue"] {
+    color: #1a1a2e !important;
+}
+[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+    color: inherit !important;
+}
+.block-container { padding-top: 1.2rem; }
+div[data-testid="stExpander"] details {
+    border: 1px solid #e1e4e8; border-radius: 8px;
+}
+.dup-badge { background: #e74c3c; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; font-weight: 600; }
+.ok-badge  { background: #27ae60; color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.8em; }
+</style>
+""", unsafe_allow_html=True)
 
-# ── SIDEBAR ──────────────────────────────────────────────────────────────────
+# ── SIDEBAR — DATA LOADING ──────────────────────────────────────────────────
 with st.sidebar:
     st.title("📰 Qbias Explorer")
-    data_dir = st.text_input("Dataset directory", value=DEFAULT_DATA_DIR)
+
+    load_method = st.radio("Load dataset", ["Upload JSON files", "Local directory path"], index=0)
+
+    if load_method == "Upload JSON files":
+        uploaded = st.file_uploader(
+            "Drop per-domain JSON files here",
+            type=["json"],
+            accept_multiple_files=True,
+        )
+    else:
+        data_dir = st.text_input(
+            "Directory path",
+            value="/nfs/home/abdullaha/qbias/Qbias/multi_source_scrape/output/per_domain",
+        )
+
+    st.divider()
     page = st.radio("Navigate", ["Dashboard", "Article Inspector", "Cleaning Log"], index=0)
 
 # ── LOAD DATA ────────────────────────────────────────────────────────────────
-if not os.path.isdir(data_dir):
-    st.error(f"Directory not found: `{data_dir}`")
+df = pd.DataFrame()
+
+if load_method == "Upload JSON files":
+    if uploaded:
+        cache_key = hashlib.md5("".join(f.name for f in uploaded).encode()).hexdigest()
+        if st.session_state.get("_upload_key") != cache_key:
+            st.session_state["_upload_key"] = cache_key
+            st.session_state["_upload_df"] = load_from_uploaded(uploaded)
+        df = st.session_state.get("_upload_df", pd.DataFrame())
+    else:
+        st.info("Upload one or more per-domain JSON files using the sidebar to get started.")
+        st.stop()
+else:
+    if not os.path.isdir(data_dir):
+        st.error(f"Directory not found: `{data_dir}`")
+        st.stop()
+    df = load_from_directory(data_dir)
+
+if df.empty:
+    st.warning("No articles found. Check your files / directory.")
     st.stop()
 
-df = load_dataset(data_dir)
-if df.empty:
-    st.warning("No articles found in the specified directory.")
-    st.stop()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PAGE 1 — DASHBOARD
@@ -127,214 +204,85 @@ if df.empty:
 if page == "Dashboard":
     st.header("Dataset Dashboard")
 
-    # ── Top-level metrics ────────────────────────────────────────────────────
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # ── Top metrics ──────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Total Articles", pretty_number(len(df)))
     c2.metric("Unique Topics", pretty_number(df["topic_slug"].nunique()))
-    c3.metric("Sources", df["domain"].nunique())
-    c4.metric("Success Rate", f"{(df['execution_status'] == 'SUCCESS').mean():.0%}")
-    avg_len = df.loc[df["execution_status"] == "SUCCESS", "text_length"].mean()
-    c5.metric("Avg Text Length", pretty_number(avg_len) if pd.notna(avg_len) else "—")
+    c3.metric("Sources", df["domain"].nunique() if "domain" in df.columns else 0)
+    c4.metric("Success Rate", f"{(df['execution_status'] == 'SUCCESS').mean():.0%}" if "execution_status" in df.columns else "—")
+    avg_len = df.loc[df["execution_status"] == "SUCCESS", "text_length"].mean() if "execution_status" in df.columns else None
+    c5.metric("Avg Text Len", pretty_number(avg_len))
+    dup_count = int(df["is_duplicate_url"].sum()) if "is_duplicate_url" in df.columns else 0
+    c6.metric("Duplicate URLs", dup_count, delta=f"{dup_count} rows" if dup_count else None, delta_color="inverse")
 
     st.divider()
 
-    # ── Row 1: Articles by Source + Rating distribution ──────────────────────
-    col_left, col_right = st.columns(2)
+    # ── Duplicate URL report ─────────────────────────────────────────────────
+    if dup_count > 0:
+        with st.expander(f"⚠️ Duplicate URLs — {dup_count} articles share a URL with another row", expanded=False):
+            dup_df = df[df["is_duplicate_url"]][["domain", "topic_slug", "stance_key", "url", "url_occurrences"]].sort_values("url_occurrences", ascending=False)
+            st.dataframe(dup_df, use_container_width=True, height=300)
 
-    with col_left:
+    # ── Row 1 ────────────────────────────────────────────────────────────────
+    col_l, col_r = st.columns(2)
+
+    with col_l:
         st.subheader("Articles by Source")
-        source_counts = (
-            df.groupby("domain")
-            .size()
-            .reset_index(name="count")
-            .sort_values("count", ascending=True)
-        )
-        fig = px.bar(
-            source_counts,
-            y="domain",
-            x="count",
-            orientation="h",
-            color_discrete_sequence=["#4a90d9"],
-        )
-        fig.update_layout(
-            yaxis_title="",
-            xaxis_title="Articles",
-            height=420,
-            margin=dict(l=0, r=20, t=10, b=30),
-        )
+        source_counts = df.groupby("domain").size().reset_index(name="count").sort_values("count", ascending=True)
+        fig = px.bar(source_counts, y="domain", x="count", orientation="h", color_discrete_sequence=["#4a90d9"])
+        fig.update_layout(yaxis_title="", xaxis_title="Articles", height=420, margin=dict(l=0, r=20, t=10, b=30))
         st.plotly_chart(fig, use_container_width=True)
 
-    with col_right:
+    with col_r:
         st.subheader("Political Rating Distribution")
-        rating_counts = (
-            df["rating"]
-            .value_counts()
-            .reindex(RATING_ORDER, fill_value=0)
-            .reset_index()
-        )
+        rating_counts = df["rating"].value_counts().reindex(RATING_ORDER, fill_value=0).reset_index()
         rating_counts.columns = ["rating", "count"]
         colors = [RATING_COLORS.get(r, "#999") for r in rating_counts["rating"]]
-        fig = go.Figure(
-            go.Bar(
-                x=rating_counts["rating"],
-                y=rating_counts["count"],
-                marker_color=colors,
-                text=rating_counts["count"],
-                textposition="outside",
-            )
-        )
-        fig.update_layout(
-            xaxis_title="",
-            yaxis_title="Articles",
-            height=420,
-            margin=dict(l=0, r=20, t=10, b=30),
-        )
+        fig = go.Figure(go.Bar(x=rating_counts["rating"], y=rating_counts["count"], marker_color=colors, text=rating_counts["count"], textposition="outside"))
+        fig.update_layout(xaxis_title="", yaxis_title="Articles", height=420, margin=dict(l=0, r=20, t=10, b=30))
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── Row 2: Execution status + Stance breakdown ───────────────────────────
-    col_left2, col_right2 = st.columns(2)
-
-    with col_left2:
+    # ── Row 2 ────────────────────────────────────────────────────────────────
+    col_l2, col_r2 = st.columns(2)
+    with col_l2:
         st.subheader("Execution Status")
         status_counts = df["execution_status"].value_counts().reset_index()
         status_counts.columns = ["status", "count"]
-        status_color_map = {
-            "SUCCESS": "#27ae60",
-            "FAILED_HTTP_404": "#e74c3c",
-            "FAILED_PARSE": "#f39c12",
-            "FAILED_PAYWALL": "#8e44ad",
-        }
-        colors = [status_color_map.get(s, "#999") for s in status_counts["status"]]
-        fig = go.Figure(
-            go.Pie(
-                labels=status_counts["status"],
-                values=status_counts["count"],
-                marker=dict(colors=colors),
-                hole=0.45,
-                textinfo="label+percent",
-            )
-        )
+        colors = [STATUS_COLOR_MAP.get(s, "#999") for s in status_counts["status"]]
+        fig = go.Figure(go.Pie(labels=status_counts["status"], values=status_counts["count"], marker=dict(colors=colors), hole=0.45, textinfo="label+percent"))
         fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
-    with col_right2:
+    with col_r2:
         st.subheader("Stance Coverage per Topic")
-        stance_per_topic = (
-            df.groupby("topic_slug")["stance_key"]
-            .nunique()
-            .value_counts()
-            .sort_index()
-            .reset_index()
-        )
+        stance_per_topic = df.groupby("topic_slug")["stance_key"].nunique().value_counts().sort_index().reset_index()
         stance_per_topic.columns = ["stances_covered", "topic_count"]
-        fig = px.bar(
-            stance_per_topic,
-            x="stances_covered",
-            y="topic_count",
-            color_discrete_sequence=["#6c5ce7"],
-            text="topic_count",
-        )
-        fig.update_layout(
-            xaxis_title="Number of Stances Covered",
-            yaxis_title="Topics",
-            height=380,
-            margin=dict(l=0, r=20, t=10, b=30),
-        )
+        fig = px.bar(stance_per_topic, x="stances_covered", y="topic_count", color_discrete_sequence=["#6c5ce7"], text="topic_count")
+        fig.update_layout(xaxis_title="Stances Covered", yaxis_title="Topics", height=380, margin=dict(l=0, r=20, t=10, b=30))
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── Row 3: Avg text length by source (anomaly spotter) ───────────────────
+    # ── Avg text length ──────────────────────────────────────────────────────
     st.subheader("Average Text Length by Source")
-    st.caption("Helps spot providers with suspiciously short or long articles.")
-
-    success_df = df[df["execution_status"] == "SUCCESS"]
-    if not success_df.empty:
-        avg_text = (
-            success_df.groupby("domain")["text_length"]
-            .agg(["mean", "median", "std", "count"])
-            .reset_index()
-            .sort_values("mean", ascending=True)
-        )
-        avg_text.columns = ["domain", "mean_len", "median_len", "std_len", "n"]
+    st.caption("Spot providers with suspiciously short or long articles.")
+    success_df = df[df["execution_status"] == "SUCCESS"] if "execution_status" in df.columns else df
+    if not success_df.empty and "text_length" in success_df.columns:
+        avg_text = success_df.groupby("domain")["text_length"].agg(["mean", "median"]).reset_index().sort_values("mean", ascending=True)
+        avg_text.columns = ["domain", "mean_len", "median_len"]
         fig = go.Figure()
-        fig.add_trace(
-            go.Bar(
-                y=avg_text["domain"],
-                x=avg_text["mean_len"],
-                orientation="h",
-                name="Mean",
-                marker_color="#4a90d9",
-                text=avg_text["mean_len"].round(0).astype(int),
-                textposition="outside",
-            )
-        )
-        fig.add_trace(
-            go.Bar(
-                y=avg_text["domain"],
-                x=avg_text["median_len"],
-                orientation="h",
-                name="Median",
-                marker_color="#a0c4e8",
-            )
-        )
-        fig.update_layout(
-            barmode="group",
-            xaxis_title="Characters",
-            yaxis_title="",
-            height=450,
-            margin=dict(l=0, r=60, t=10, b=30),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
+        fig.add_trace(go.Bar(y=avg_text["domain"], x=avg_text["mean_len"], orientation="h", name="Mean", marker_color="#4a90d9", text=avg_text["mean_len"].round(0).astype(int), textposition="outside"))
+        fig.add_trace(go.Bar(y=avg_text["domain"], x=avg_text["median_len"], orientation="h", name="Median", marker_color="#a0c4e8"))
+        fig.update_layout(barmode="group", xaxis_title="Characters", yaxis_title="", height=450, margin=dict(l=0, r=60, t=10, b=30), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── Row 4: Timeline ─────────────────────────────────────────────────────
-    if "scrape_date" in df.columns:
-        st.subheader("Scrape Timeline")
-        timeline = (
-            df.groupby(["scrape_date", "domain"])
-            .size()
-            .reset_index(name="count")
-        )
-        fig = px.area(
-            timeline,
-            x="scrape_date",
-            y="count",
-            color="domain",
-            height=380,
-        )
-        fig.update_layout(
-            xaxis_title="",
-            yaxis_title="Articles scraped",
-            margin=dict(l=0, r=20, t=10, b=30),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ── Row 5: Failure breakdown by source ───────────────────────────────────
-    failures = df[df["execution_status"] != "SUCCESS"]
-    if not failures.empty:
-        st.subheader("Failures by Source & Type")
-        fail_matrix = (
-            failures.groupby(["domain", "execution_status"])
-            .size()
-            .reset_index(name="count")
-        )
-        fig = px.bar(
-            fail_matrix,
-            x="domain",
-            y="count",
-            color="execution_status",
-            barmode="stack",
-            color_discrete_map=status_color_map,
-            height=380,
-        )
-        fig.update_layout(
-            xaxis_title="",
-            yaxis_title="Failed articles",
-            margin=dict(l=0, r=20, t=10, b=30),
-            xaxis_tickangle=-45,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    # ── Failures ─────────────────────────────────────────────────────────────
+    if "execution_status" in df.columns:
+        failures = df[df["execution_status"] != "SUCCESS"]
+        if not failures.empty:
+            st.subheader("Failures by Source & Type")
+            fail_matrix = failures.groupby(["domain", "execution_status"]).size().reset_index(name="count")
+            fig = px.bar(fail_matrix, x="domain", y="count", color="execution_status", barmode="stack", color_discrete_map=STATUS_COLOR_MAP, height=380)
+            fig.update_layout(xaxis_title="", yaxis_title="Failed articles", margin=dict(l=0, r=20, t=10, b=30), xaxis_tickangle=-45, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            st.plotly_chart(fig, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -345,32 +293,15 @@ elif page == "Article Inspector":
 
     cleaning_log = load_cleaning_log()
 
-    # ── Sidebar filters ─────────────────────────────────────────────────────
+    # ── Sidebar filters ──────────────────────────────────────────────────────
     with st.sidebar:
         st.subheader("Filters")
+        filter_domain = st.multiselect("Source / Domain", sorted(df["domain"].unique()), default=[])
+        filter_rating = st.multiselect("Rating", RATING_ORDER, default=[])
+        filter_status = st.multiselect("Execution Status", sorted(df["execution_status"].unique()), default=[])
+        filter_stance = st.multiselect("Stance Key", sorted(df["stance_key"].unique()), default=[])
+        filter_dupes = st.checkbox("Only duplicate URLs", value=False)
 
-        filter_domain = st.multiselect(
-            "Source / Domain",
-            options=sorted(df["domain"].unique()),
-            default=[],
-        )
-        filter_rating = st.multiselect(
-            "Rating",
-            options=RATING_ORDER,
-            default=[],
-        )
-        filter_status = st.multiselect(
-            "Execution Status",
-            options=sorted(df["execution_status"].unique()),
-            default=[],
-        )
-        filter_stance = st.multiselect(
-            "Stance Key",
-            options=sorted(df["stance_key"].unique()),
-            default=[],
-        )
-
-    # Apply filters
     filtered = df.copy()
     if filter_domain:
         filtered = filtered[filtered["domain"].isin(filter_domain)]
@@ -380,6 +311,8 @@ elif page == "Article Inspector":
         filtered = filtered[filtered["execution_status"].isin(filter_status)]
     if filter_stance:
         filtered = filtered[filtered["stance_key"].isin(filter_stance)]
+    if filter_dupes and "is_duplicate_url" in filtered.columns:
+        filtered = filtered[filtered["is_duplicate_url"]]
 
     if filtered.empty:
         st.info("No articles match the current filters.")
@@ -388,101 +321,139 @@ elif page == "Article Inspector":
     st.caption(f"**{len(filtered):,}** articles match your filters.")
 
     # ── Article selection ────────────────────────────────────────────────────
-    sel_col1, sel_col2 = st.columns([3, 1])
-    with sel_col1:
-        options_map = {
-            f"[{row['domain']}] {row['extracted_headline'][:80] if pd.notna(row['extracted_headline']) else row['topic_slug']}"
-            + f"  ({row['stance_key']})": idx
-            for idx, row in filtered.iterrows()
-        }
-        selected_label = st.selectbox(
-            "Select an article",
-            options=list(options_map.keys()),
-            index=0,
-        )
-    with sel_col2:
-        if st.button("🎲 Random Article", use_container_width=True):
-            rand_idx = random.choice(filtered.index.tolist())
-            st.session_state["_rand_idx"] = rand_idx
+    sel1, sel2 = st.columns([4, 1])
+    with sel1:
+        options_map = {}
+        for idx, row in filtered.iterrows():
+            hl = row["extracted_headline"][:70] if pd.notna(row.get("extracted_headline")) else row["topic_slug"][:50]
+            dup_tag = " 🔴DUP" if row.get("is_duplicate_url") else ""
+            label = f"[{row['domain']}] {hl}  ({row['stance_key']}){dup_tag}"
+            options_map[label] = idx
+        selected_label = st.selectbox("Select an article", list(options_map.keys()), index=0)
+    with sel2:
+        if st.button("🎲 Random", use_container_width=True):
+            st.session_state["_rand_idx"] = random.choice(filtered.index.tolist())
             st.rerun()
 
-    # Handle random selection
     if "_rand_idx" in st.session_state:
         rand_idx = st.session_state.pop("_rand_idx")
-        if rand_idx in filtered.index:
-            art = filtered.loc[rand_idx]
-        else:
-            art = filtered.iloc[0]
+        art = filtered.loc[rand_idx] if rand_idx in filtered.index else filtered.iloc[0]
     else:
         art = filtered.loc[options_map[selected_label]]
 
     st.divider()
 
-    # ── Metadata block ───────────────────────────────────────────────────────
-    m1, m2, m3, m4 = st.columns(4)
+    # ── Metadata cards ───────────────────────────────────────────────────────
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Domain", art["domain"])
     m2.metric("Rating", art.get("rating", "—"))
     m3.metric("Stance", art.get("stance_key", "—"))
     m4.metric("Status", art.get("execution_status", "—"))
+    m5.metric("HTTP", art.get("http_status_code", "—"))
 
-    m5, m6, m7, m8 = st.columns(4)
-    m5.metric("HTTP Code", art.get("http_status_code", "—"))
-    m6.metric(
-        "Text Length",
-        f"{art.get('text_length', 0):,} chars" if pd.notna(art.get("text_length")) else "—",
-    )
-    ts = art.get("scrape_timestamp")
-    m7.metric("Scraped", ts.strftime("%Y-%m-%d %H:%M") if pd.notna(ts) else "—")
-    m8.metric("Topic Slug", art["topic_slug"][:25] + "…" if len(str(art["topic_slug"])) > 25 else art["topic_slug"])
+    m6, m7, m8 = st.columns(3)
+    m6.metric("Text Length", f"{art.get('text_length', 0):,} chars" if pd.notna(art.get("text_length")) else "—")
+    slug = str(art["topic_slug"])
+    m7.metric("Topic", slug[:30] + "…" if len(slug) > 30 else slug)
+    is_dup = art.get("is_duplicate_url", False)
+    dup_n = int(art.get("url_occurrences", 1))
+    m8.metric("URL Copies", dup_n, delta="DUPLICATE" if is_dup else "unique", delta_color="inverse" if is_dup else "normal")
 
-    with st.expander("🔗 URL & Source File"):
-        st.code(art.get("url", "—"), language=None)
-        st.caption(f"Source file: `{art.get('source_file', '—')}`  |  Topic: `{art['topic_slug']}`")
+    # URL bar
+    url = art.get("url", "")
+    if url:
+        dup_html = f'  <span class="dup-badge">DUPLICATE ×{dup_n}</span>' if is_dup else '  <span class="ok-badge">unique</span>'
+        st.markdown(f'🔗 **URL:** `{url}`{dup_html}', unsafe_allow_html=True)
+    st.caption(f"Source file: `{art.get('source_file', '—')}`")
+
+    # If duplicate, show the other articles sharing this URL
+    if is_dup:
+        with st.expander(f"🔴 {dup_n} articles share this URL — click to see all"):
+            dup_rows = df[df["url"] == url][["domain", "topic_slug", "stance_key", "extracted_headline", "source_file"]]
+            st.dataframe(dup_rows, use_container_width=True)
 
     st.divider()
 
-    # ── Article content + image ──────────────────────────────────────────────
-    content_col, image_col = st.columns([3, 2])
-
-    with content_col:
-        st.subheader(art.get("extracted_headline") or "*(no headline)*")
-        body = art.get("extracted_body_text")
-        if body and str(body).strip():
-            st.markdown(
-                f'<div style="max-height:500px; overflow-y:auto; padding:12px; '
-                f'background:#fafafa; border:1px solid #e1e4e8; border-radius:8px; '
-                f'line-height:1.7; font-size:0.95rem;">{body}</div>',
-                unsafe_allow_html=True,
+    # Auto-open the original page in a new browser tab
+    if url:
+        art_id = f"{art.get('source_file', '')}_{art.get('topic_slug', '')}_{art.get('stance_key', '')}"
+        if st.session_state.get("_last_opened_art") != art_id:
+            st.session_state["_last_opened_art"] = art_id
+            st.components.v1.html(
+                f'<script>window.open("{url}", "_blank");</script>',
+                height=0,
             )
-        else:
-            st.warning("No body text extracted for this article.")
 
-    with image_col:
-        images = art.get("extracted_images")
-        if isinstance(images, list) and len(images) > 0:
-            st.subheader("Images")
-            for img in images[:5]:
+    st.subheader("Extracted Content")
+
+    # ── Article headline + raw JSON toggle ─────────────────────────────
+    headline = art.get("extracted_headline")
+    if headline and str(headline).strip():
+        st.markdown(f"# {str(headline).strip()}")
+
+    # Build the original JSON object for this datapoint
+    json_fields = [
+        "domain", "url", "rating", "http_status_code",
+        "execution_status", "extracted_headline", "extracted_body_text",
+        "error_payload", "extracted_images", "extracted_interactives",
+        "extracted_videos",
+    ]
+    raw_obj = {}
+    for field in json_fields:
+        val = art.get(field)
+        if val is not None:
+            try:
+                if pd.notna(val):
+                    raw_obj[field] = val
+            except (TypeError, ValueError):
+                raw_obj[field] = val
+
+    with st.expander("🔍 Raw JSON for this datapoint"):
+        st.code(json.dumps(raw_obj, indent=2, default=str), language="json")
+
+    body = str(art.get("extracted_body_text", "") or "")
+
+    # ── Full article body (rendered as markdown) ─────────────────────────
+    with st.expander("📝 Full Article Text", expanded=True):
+        if body.strip():
+            st.markdown(body.replace("$", "\\$"))
+        else:
+            st.warning("No body text extracted.")
+
+    # ── Images with captions ─────────────────────────────────────────────
+    images = safe_list(art.get("extracted_images"))
+    if images:
+        with st.expander(f"🖼️ Images ({len(images)})", expanded=True):
+            for i, img in enumerate(images):
                 if isinstance(img, dict):
                     img_url = img.get("url", "")
                     alt = img.get("alt", "")
+                    caption = img.get("caption", "")
                 else:
-                    img_url = str(img)
-                    alt = ""
+                    img_url, alt, caption = str(img), "", ""
+
                 if img_url:
-                    st.image(img_url, caption=alt[:120] if alt else None, use_container_width=True)
-        else:
-            st.info("No images extracted for this article.")
+                    st.image(img_url, use_container_width=True)
+                    info_parts = []
+                    if caption:
+                        info_parts.append(f"**Caption:** {caption}")
+                    if alt:
+                        info_parts.append(f"**Alt:** {alt}")
+                    info_parts.append(f"`{img_url}`")
+                    st.markdown("  \n".join(info_parts))
+                    if i < len(images) - 1:
+                        st.divider()
+    else:
+        st.info("No images extracted.")
 
-        videos = art.get("extracted_videos")
-        if isinstance(videos, list) and len(videos) > 0:
-            with st.expander(f"🎬 Videos ({len(videos)})"):
-                for v in videos[:5]:
-                    if isinstance(v, dict):
-                        st.code(v.get("url", str(v)), language=None)
-                    else:
-                        st.code(str(v), language=None)
+    # ── Videos ───────────────────────────────────────────────────────────
+    videos = safe_list(art.get("extracted_videos"))
+    if videos:
+        with st.expander(f"🎬 Videos ({len(videos)})"):
+            for v in videos[:5]:
+                st.code(v.get("url", str(v)) if isinstance(v, dict) else str(v), language=None)
 
-    # ── Error payload ────────────────────────────────────────────────────────
+    # ── Error payload ────────────────────────────────────────────────────
     err = art.get("error_payload")
     if err and str(err).strip() and str(err) != "None":
         with st.expander("⚠️ Error Payload"):
@@ -504,6 +475,7 @@ elif page == "Article Inspector":
         "Content mismatch (headline ≠ body)",
         "Paywall / incomplete content",
         "Duplicate article",
+        "Headings not in markdown",
         "Other",
     ]
 
@@ -530,7 +502,7 @@ elif page == "Article Inspector":
             "Notes",
             value=existing.iloc[0]["notes"] if has_existing else "",
             height=120,
-            placeholder="Add observations about this article or its provider …",
+            placeholder="Add observations about this article or provider …",
             key=f"notes_{uid}",
         )
 
@@ -543,13 +515,9 @@ elif page == "Article Inspector":
             "timestamp": datetime.now().isoformat(),
         }
         if has_existing:
-            cleaning_log.loc[cleaning_log["uid"] == uid, list(new_row.keys())] = list(
-                new_row.values()
-            )
+            cleaning_log.loc[cleaning_log["uid"] == uid, list(new_row.keys())] = list(new_row.values())
         else:
-            cleaning_log = pd.concat(
-                [cleaning_log, pd.DataFrame([new_row])], ignore_index=True
-            )
+            cleaning_log = pd.concat([cleaning_log, pd.DataFrame([new_row])], ignore_index=True)
         save_cleaning_log(cleaning_log)
         st.success("Annotation saved.")
 
@@ -576,12 +544,12 @@ elif page == "Cleaning Log":
 
     st.divider()
 
-    # Merge with main dataset for richer view
     log_enriched = cleaning_log.copy()
     log_enriched["uid"] = log_enriched["uid"].astype(str)
-    df["uid"] = df.index.astype(str)
+    df_for_merge = df.copy()
+    df_for_merge["uid"] = df_for_merge.index.astype(str)
     log_enriched = log_enriched.merge(
-        df[["uid", "domain", "extracted_headline", "topic_slug", "rating", "execution_status"]],
+        df_for_merge[["uid", "domain", "extracted_headline", "topic_slug", "rating", "execution_status"]],
         on="uid",
         how="left",
     )
@@ -590,14 +558,7 @@ elif page == "Cleaning Log":
     if show_flagged_only:
         log_enriched = log_enriched[log_enriched["flagged"] == "True"]
 
-    display_cols = [
-        "domain",
-        "extracted_headline",
-        "flagged",
-        "flag_reason",
-        "notes",
-        "timestamp",
-    ]
+    display_cols = ["domain", "extracted_headline", "flagged", "flag_reason", "notes", "timestamp"]
     available_cols = [c for c in display_cols if c in log_enriched.columns]
     st.dataframe(
         log_enriched[available_cols],
@@ -612,13 +573,11 @@ elif page == "Cleaning Log":
 
     st.divider()
 
-    # Export
     col_dl1, col_dl2 = st.columns(2)
     with col_dl1:
-        csv_data = cleaning_log.to_csv(index=False)
         st.download_button(
             "📥 Download Cleaning Log (CSV)",
-            data=csv_data,
+            data=cleaning_log.to_csv(index=False),
             file_name="cleaning_log.csv",
             mime="text/csv",
             use_container_width=True,

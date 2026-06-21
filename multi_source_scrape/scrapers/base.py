@@ -232,7 +232,7 @@ def extract_trafilatura(html):
     return headline, body
 
 
-def scrape_item(session, item, parse_fn, extra_headers=None, debug=False):
+def scrape_item(session, item, parse_fn, extra_headers=None, debug=False, body_filter=None):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     status_code, html, err_status, err_msg = fetch_page(
         session, item["url"], item["domain"],
@@ -281,6 +281,11 @@ def scrape_item(session, item, parse_fn, extra_headers=None, debug=False):
             if debug:
                 print(f"  [trafilatura fallback: {len(body)}c]")
 
+    if body and body_filter and not body_filter(body):
+        if debug:
+            print(f"  [body_filter rejected: {len(body)}c]")
+        body = ""
+
     if not body or len(body) < 50:
         result = {
             "domain": item["domain"],
@@ -321,7 +326,7 @@ def scrape_item(session, item, parse_fn, extra_headers=None, debug=False):
     return result
 
 
-def run_scraper(domain, parse_fn, extra_headers=None):
+def run_scraper(domain, parse_fn, extra_headers=None, body_filter=None):
     parser = argparse.ArgumentParser(
         description=f"AllSides scraper for {domain}"
     )
@@ -393,7 +398,8 @@ def run_scraper(domain, parse_fn, extra_headers=None):
         print(f"[{i+1}/{len(pending)}] ({item['slot']}) {short_url}", end=" ", flush=True)
 
         result = scrape_item(session, item, parse_fn,
-                             extra_headers=extra_headers, debug=args.debug)
+                             extra_headers=extra_headers, debug=args.debug,
+                             body_filter=body_filter)
         write_result(output, item["story_id"], item["slot"], result)
         session_count += 1
 

@@ -1,9 +1,16 @@
-import sys, os, json
+import sys, os, json, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from base import run_scraper
 from bs4 import BeautifulSoup
 
 DOMAIN = "theguardian.com"
+
+_MEDIA_HASH_RE = re.compile(r'/img/media/([a-f0-9]{40})/')
+
+
+def _img_key(url):
+    m = _MEDIA_HASH_RE.search(url)
+    return m.group(1) if m else url.split("?")[0]
 
 
 def _extract_images(soup):
@@ -20,8 +27,9 @@ def _extract_images(soup):
                 img = pic.find("img")
         if img:
             src = img.get("src", "")
-            if src and src.startswith("http") and src not in seen:
-                seen.add(src)
+            key = _img_key(src) if src else ""
+            if src and src.startswith("http") and key not in seen:
+                seen.add(key)
                 alt = img.get("alt", "")
                 cap = fig.find("figcaption")
                 caption = cap.get_text(" ", strip=True) if cap else ""
@@ -37,8 +45,9 @@ def _extract_images(soup):
                 items = img_data if isinstance(img_data, list) else [img_data]
                 for item in items:
                     img_url = item.get("url", "") if isinstance(item, dict) else str(item)
-                    if img_url and img_url not in seen:
-                        seen.add(img_url)
+                    key = _img_key(img_url) if img_url else ""
+                    if img_url and key not in seen:
+                        seen.add(key)
                         images.append({"url": img_url, "alt": ""})
         except Exception:
             pass
@@ -48,7 +57,11 @@ def _extract_images(soup):
         if og:
             src = og.get("content", "")
             if src:
-                images.append({"url": src, "alt": ""})
+                og_alt = soup.find("meta", property="og:image:alt")
+                alt = og_alt.get("content", "") if og_alt else ""
+                og_desc = soup.find("meta", property="og:description")
+                caption = og_desc.get("content", "") if og_desc else ""
+                images.append({"url": src, "alt": alt, "caption": caption})
 
     return images
 
