@@ -62,16 +62,6 @@ python bbc.py --mode scrape --output-dir /path/to/output
 
 Scrapers automatically download article images to `output/images/{domain}/{story_id}/{stance}/` and add a `local_path` field to each image entry in the JSON.
 
-#### Bulk Image Download
-
-To download images for already-scraped data (without re-scraping):
-
-```bash
-python multi_source_scrape/output/download_images.py
-```
-
-This reads `output/per_domain/*.json`, downloads all image URLs, and writes cleaned JSON (with `local_path` fields, failed entries removed) to `output/per_domain_clean/`.
-
 #### Scraped Domains
 
 | Stance | Domains |
@@ -86,11 +76,9 @@ All scrapers use `scrapers/base.py` for shared infrastructure (session rotation,
 
 ```
 multi_source_scrape/output/
-├── per_domain/              # Raw scraped JSON (one file per domain)
-├── per_domain_clean/        # Cleaned JSON with local_path, failed entries removed
+├── per_domain/              # Scraped JSON (one file per domain, with local_path for images)
 ├── images/                  # Downloaded article images
 │   └── {domain}/{story_id}/{stance}/{index}_{filename}
-└── download_images.py       # Bulk image downloader
 ```
 
 ## Corpus Status
