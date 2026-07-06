@@ -215,6 +215,96 @@ Actual Left   329     162     293     (42.0% / 20.7% / 37.4%)
 - **Publisher stripping:** 0 missed names in stripped condition; 58.4% of articles contain publisher name in body text
 - **Checkpointing:** JSONL append with skip-completed on re-run for crash safety
 
+---
+
+## AllSides Dataset Results (21,754 articles, 465 sources, 3-class)
+
+A broader validation on the full AllSides CSV — no publisher stripping/swapping (too many sources), just classification accuracy with **short vs long** analysis.
+
+### Overall Accuracy
+
+| Model | All (21,754) | Long ≥200 chars (17,704) | Short <200 chars (4,050) |
+|-------|-------------|--------------------------|--------------------------|
+| **Encoder** | **52.7%** / 49.0% | 52.6% / 49.7% | 52.9% / 44.0% |
+| **NLI** | 33.5% / 33.5% | 34.2% / 34.1% | 30.7% / 30.7% |
+| **LLM** | 37.9% / 37.2% | 39.0% / 38.3% | 33.4% / 32.7% |
+
+### Accuracy by Article Length Bucket
+
+| Model | <100 chars | 100–500 | 500–2000 |
+|-------|-----------|---------|----------|
+| **Encoder** | **62.7%** | 52.9% | 51.9% |
+| **NLI** | 27.3% | 31.6% | 35.6% |
+| **LLM** | 29.7% | 35.8% | 40.3% |
+
+### Length Pattern
+
+**The encoder and NLI/LLM show opposite trends with article length:**
+
+- **Encoder performs BETTER on short text** (62.7% on <100 chars vs 51.9% on 500–2000). This suggests the encoder relies on headline-level cues (source framing, word choice) which are concentrated in short text. Longer articles dilute these signals with neutral reporting content.
+- **NLI and LLM perform BETTER on long text** (NLI: 35.6% on 500–2000 vs 27.3% on <100; LLM: 40.3% vs 29.7%). These models need more context to build a stance signal — short headlines don't provide enough content for zero-shot inference.
+
+### Top 10 Sources — Per-Model Accuracy
+
+| Source | Encoder | NLI | LLM |
+|--------|---------|-----|-----|
+| Fox News (Online News) | **64.1%** | 34.4% | 43.2% |
+| CNN (Online News) | 55.5% | 25.8% | 24.5% |
+| Washington Post | 56.8% | 25.7% | 29.4% |
+| New York Times (News) | **68.4%** | 27.7% | 29.2% |
+| Washington Times | 60.8% | 37.8% | 44.1% |
+| The Hill (center) | **17.5%** | 33.5% | 27.3% |
+| Wall Street Journal (News) | 39.5% | **48.2%** | **44.3%** |
+| HuffPost | 54.4% | 32.8% | 38.0% |
+| Politico | 56.7% | 30.5% | 28.7% |
+| Washington Examiner | 49.2% | 26.5% | 36.0% |
+
+Notable: The encoder gets **17.5% on The Hill** (center-rated) — consistent with the multi_source_scrape finding that center is the hardest class. WSJ is the one source where NLI and LLM outperform the encoder.
+
+### AllSides Confusion Matrices
+
+#### Encoder (52.7% acc)
+```
+              Left    Center  Right
+Actual Left   5900    1492    2883    (57.4% / 14.5% / 28.1%)
+       Center 1727    1338    1188    (40.6% / 31.5% / 27.9%)
+       Right  2147     856    4223    (29.7% / 11.8% / 58.4%)
+```
+
+#### NLI (33.5% acc)
+```
+              Left    Center  Right
+Actual Left   2895    4859    2521    (28.2% / 47.3% / 24.5%)
+       Center 1148    2034    1071    (27.0% / 47.8% / 25.2%)
+       Right  1878    2982    2366    (26.0% / 41.3% / 32.7%)
+```
+
+#### LLM (37.9% acc)
+```
+              Left    Center  Right
+Actual Left   3293    3879    3103    (32.1% / 37.8% / 30.2%)
+       Center 1233    1694    1326    (29.0% / 39.8% / 31.2%)
+       Right  1704    2254    3268    (23.6% / 31.2% / 45.2%)
+```
+
+### AllSides vs Multi-Source Comparison
+
+| Model | Multi-Source (2,897 art, 15 pubs) | AllSides (21,754 art, 465 pubs) | Delta |
+|-------|-----------------------------------|----------------------------------|-------|
+| **Encoder** | 65.7% | 52.7% | −13.0 pp |
+| **NLI** | 41.8% | 33.5% | −8.3 pp |
+| **LLM** | 42.5% | 37.9% | −4.6 pp |
+
+All models perform worse on AllSides — likely because: (1) AllSides has 465 sources (many unfamiliar to models), (2) 18.6% are short/headline-only, (3) class imbalance is stronger (47% left vs 20% center). The **LLM degrades the least** (−4.6 pp), consistent with it being the most content-driven classifier.
+
+---
+
+## Full Metrics
+
+All computed metrics saved to:
+- `analysis/allsides_metrics.json` — per-model accuracy, F1, confusion matrices, per-source and per-length-bucket breakdowns
+- `analysis/allsides_summary.jsonl` — compact row-per-split format for downstream analysis
+
 ## Interactive Visualization
 
 See the companion HTML artifact for interactive confusion matrix heatmaps with tooltips, filterable by model tier and class count.
