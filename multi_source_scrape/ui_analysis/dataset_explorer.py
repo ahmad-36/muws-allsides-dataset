@@ -305,8 +305,8 @@ and excerpts), we crawl the linked articles directly from the publishers to obta
   AllSides bias rating **at crawl time**.
 - Publisher images are stored under `multi_source_scrape/output/images/<domain>/<slug>/<stance>/`.
 - AllSides stance images are stored under `allsides_crawl/output/images/<slug>/<stance>/`
-  and referenced by `image_local_path` (see `allsides_crawl/crawler/repair_dataset.py`,
-  which also restored the full story summaries).
+  and referenced by `image_local_path` (see `allsides_crawl/crawler/allsides_crawler.py`,
+  whose repair passes also restored the full story summaries).
 """)
 
     n_as_imgs = sum(
@@ -692,7 +692,7 @@ else:
                     else '<span class="crawl-flag nok" title="Not crawled">✗</span>'
                 extra_cls = "" if is_crawled else " missing"
 
-                # AllSides stance image, stored locally by repair_dataset.py
+                # AllSides stance image, stored locally by allsides_crawler.py
                 img_html = ""
                 local_img = meta.get("image_local_path")
                 if local_img:
